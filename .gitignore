@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.egg-info/
+
+# Environment
+.venv/
+env/
+conda/
+
+# Dataset
+data/
+dataset/
+datasets/
+input/
+COLMAP/
+colmap/
+images/
+sparse/
+dense/
+
+# Outputs
+output/
+outputs/
+results/
+render/
+renders/
+eval/
+logs/
+runs/
+wandb/
+tensorboard/
+nohup.out
+*.log
+
+# Checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.pkl
+*.npz
+*.npy
+
+# 3D assets / large generated files
+*.ply
+*.obj
+*.glb
+*.gltf
+*.mesh
+*.pcd
+*.npz
+*.mp4
+*.avi
+*.mov
+
+# HuggingFace / cache
+.cache/
+huggingface/
+huggingface_cache/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store

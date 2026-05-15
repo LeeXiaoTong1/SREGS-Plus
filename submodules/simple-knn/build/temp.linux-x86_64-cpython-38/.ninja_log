@@ -1,0 +1,4 @@
+# ninja log v7
+1	10448	1777355684826173123	/root/autodl-tmp/FSV2MC2D/submodules/simple-knn/build/temp.linux-x86_64-cpython-38/simple_knn.o	31a2c6c4e43b4d09
+0	22150	1777355684826173123	/root/autodl-tmp/FSV2MC2D/submodules/simple-knn/build/temp.linux-x86_64-cpython-38/ext.o	8867d1935e9b3df9
+1	50782	1777355684826173123	/root/autodl-tmp/FSV2MC2D/submodules/simple-knn/build/temp.linux-x86_64-cpython-38/spatial.o	7fc39c212512b9e8
