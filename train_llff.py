@@ -39,7 +39,6 @@ from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.normal_utils import stable_normal_prior_term
 # from utils.consist_view import xview_reproj_depth_loss, quick_inb_ratio, clear_consist_view_cache
-from utils.helper import TrainingAuxHelper
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from lpipsPyTorch import lpips
 from scene.gaussian_model import build_scaling_rotation
@@ -79,13 +78,6 @@ def training(dataset, opt, pipe, args, depth_model):
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
-    helper = TrainingAuxHelper(
-        scene=scene,
-        pipe=pipe,
-        background=background,
-        args=args,
-    )
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
 
@@ -177,34 +169,6 @@ def training(dataset, opt, pipe, args, depth_model):
         )
         loss += 0.02 * loss_l2_dpt
 
-        # ============================================================
-        # Module-1: Weak global Xview consistency
-        # ============================================================
-        loss = helper.apply_xview_loss(
-            iteration=iteration,
-            loss=loss,
-            viewpoint_cam=viewpoint_cam,
-            render_pkg=render_pkg,
-            gaussians=gaussians,
-        )
-
-        # ============================================================
-        # Patch-conditioned local repair
-        # Extra loss on top of global Xview.
-        # ============================================================
-
-        loss = helper.apply_patch_repair_loss(
-            iteration=iteration,
-            loss=loss,
-            viewpoint_cam=viewpoint_cam,
-            render_pkg=render_pkg,
-            image=image,
-            gt_image=gt_image,
-            rendered_depth_2d=rendered_depth_2d,
-            midas_depth_resized=midas_depth_resized,
-            gaussians=gaussians,
-        )
-
         loss.backward()
 
         with torch.no_grad():
@@ -220,10 +184,6 @@ def training(dataset, opt, pipe, args, depth_model):
             training_report(tb_writer, iteration, Ll1, loss, l1_loss,
                             testing_iterations, scene, render, (pipe, background))
             
-            if getattr(args, "qwen_online", False):
-                helper.run_qwen_if_needed(iteration, gaussians)
-            else:
-                helper.mine_patches_if_needed(iteration, gaussians)
 
             if iteration > first_iter and (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
