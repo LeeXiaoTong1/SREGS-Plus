@@ -39,6 +39,7 @@ from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.normal_utils import stable_normal_prior_term
 # from utils.consist_view import xview_reproj_depth_loss, quick_inb_ratio, clear_consist_view_cache
+from utils.vla_sregs import VLASREGSController
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from lpipsPyTorch import lpips
 from scene.gaussian_model import build_scaling_rotation
@@ -47,6 +48,7 @@ from depth_anything_v2.dpt import DepthAnythingV2
 
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+
 def load_depth_model(mode='vitl'):
     model_configs = {
         'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -79,6 +81,21 @@ def training(dataset, opt, pipe, args, depth_model):
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    vla_controller = None
+    if getattr(args, "vla_enable", False):
+        vla_controller = VLASREGSController(
+            scene=scene,
+            pipe=pipe,
+            background=background,
+            args=args,
+            render_func=render,
+        )
+        print(
+            "[VLA] enabled: "
+            f"start={args.vla_start_iter}, interval={args.vla_interval}, "
+            f"inb=[{args.vla_inb_min}, {args.vla_inb_max}], ttl={args.vla_mask_ttl}"
+        )
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
 
     viewpoint_stack, pseudo_stack = None, None
@@ -102,7 +119,7 @@ def training(dataset, opt, pipe, args, depth_model):
         
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
+        # Every 500 its we increase the levels of SH up to a maximum degree
         if iteration % 500 == 0:
             gaussians.oneupSHdegree()
 
@@ -132,7 +149,6 @@ def training(dataset, opt, pipe, args, depth_model):
         normal_loss = lambda_normal * (normal_error).mean()
 
         loss = loss + normal_loss
-        # if iteration < 2000:
         loss = loss + args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
 
         rendered_depth_2d = render_pkg["depth"][0]
@@ -169,7 +185,19 @@ def training(dataset, opt, pipe, args, depth_model):
         )
         loss += 0.02 * loss_l2_dpt
 
+        # ============================================================
+        # VLA-SREGS core loop:
+        # Pseudo View -> Qwen mask -> 2D mask maps to Gaussians ->
+        # Gaussian-level anti-overfitting update.
+        # ============================================================
+        if vla_controller is not None:
+            loss = vla_controller.maybe_apply(iteration, loss, gaussians)
+
         loss.backward()
+
+        if vla_controller is not None:
+            with torch.no_grad():
+                vla_controller.apply_gradient_modulation(iteration, gaussians)
 
         with torch.no_grad():
             # Progress bar
@@ -183,6 +211,9 @@ def training(dataset, opt, pipe, args, depth_model):
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss,
                             testing_iterations, scene, render, (pipe, background))
+            if tb_writer and vla_controller is not None and vla_controller.last_info:
+                for k, v in vla_controller.last_info.items():
+                    tb_writer.add_scalar(k, v, iteration)
             
 
             if iteration > first_iter and (iteration in saving_iterations):
@@ -203,6 +234,8 @@ def training(dataset, opt, pipe, args, depth_model):
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, opt.prune_threshold, scene.cameras_extent, size_threshold, iteration)
+                    if vla_controller is not None:
+                        vla_controller.sync_after_topology_change(gaussians)
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -213,6 +246,8 @@ def training(dataset, opt, pipe, args, depth_model):
             if (iteration - args.start_sample_pseudo - 1) % opt.opacity_reset_interval == 0 and \
                     iteration > args.start_sample_pseudo:
                 gaussians.reset_opacity()
+                if vla_controller is not None:
+                    vla_controller.clear_active_masks()
 
 
 def prepare_output_and_logger(args):
@@ -285,6 +320,44 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, testing_iterations
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
+
+def add_vla_args(parser: ArgumentParser):
+    parser.add_argument("--vla_enable", action="store_true", default=False,
+                        help="Enable VLA-SREGS: pseudo view -> Qwen mask -> mask-to-Gaussian -> anti-overfitting update.")
+    parser.add_argument("--vla_start_iter", type=int, default=5000)
+    parser.add_argument("--vla_interval", type=int, default=500)
+    parser.add_argument("--vla_mask_ttl", type=int, default=500)
+    parser.add_argument("--vla_num_candidates", type=int, default=8)
+    parser.add_argument("--vla_score_num_points", type=int, default=20000)
+    parser.add_argument("--vla_inb_min", type=float, default=0.55)
+    parser.add_argument("--vla_inb_max", type=float, default=0.82)
+    parser.add_argument("--vla_min_region_conf", type=float, default=0.35)
+    parser.add_argument("--vla_max_regions", type=int, default=6)
+    parser.add_argument("--vla_max_gaussians_per_type", type=int, default=40000)
+    parser.add_argument("--vla_depth_gate", type=float, default=0.0,
+                        help="Optional relative depth gate for mask-to-Gaussian mapping. 0 disables it.")
+
+    parser.add_argument("--vla_geo_opacity_reg", type=float, default=0.005)
+    parser.add_argument("--vla_geo_scale_reg", type=float, default=0.0005)
+    parser.add_argument("--vla_app_sh_reg", type=float, default=0.0015)
+    parser.add_argument("--vla_geo_opacity_growth_scale", type=float, default=0.15)
+    parser.add_argument("--vla_geo_scaling_grad_scale", type=float, default=0.50)
+    parser.add_argument("--vla_app_sh_grad_scale", type=float, default=0.10)
+    parser.add_argument("--vla_app_dc_grad_scale", type=float, default=0.50)
+
+    parser.add_argument("--vla_qwen_env", type=str, default="qwen3vl")
+    parser.add_argument("--vla_qwen_model", type=str, default="",
+                        help="Local Qwen3-VL model path/name. Can also be set through QWEN3VL_MODEL in qwen env.")
+    parser.add_argument("--vla_qwen_worker", type=str, default="tools/qwen_vla_mask_worker.py")
+    parser.add_argument("--vla_qwen_cmd", type=str, default="",
+                        help="Optional custom command. Supports {image}, {panel}, {out}, {model} placeholders.")
+    parser.add_argument("--vla_qwen_timeout", type=int, default=240)
+    parser.add_argument("--vla_require_qwen", action="store_true", default=False)
+    parser.add_argument("--vla_fallback_miner", action="store_true", default=False,
+                        help="Debug only. Use heuristic boxes if Qwen returns no boxes.")
+    parser.add_argument("--vla_panel_side", type=int, default=512)
+
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training")
@@ -302,6 +375,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--train_bg", action="store_true")
     parser.add_argument("--qwen_online", action="store_true", default=False)
+    add_vla_args(parser)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 

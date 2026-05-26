@@ -81,10 +81,14 @@ class Scene:
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, depth_model)
 
             pseudo_cams = []
-            if args.source_path.find('llff'):
-                pseudo_poses = generate_random_poses_llff(self.train_cameras[resolution_scale])
-            elif args.source_path.find('360'):
+            source_lower = str(args.source_path).lower()
+            # str.find() returns -1 when not found, and -1 is truthy in Python.
+            # Use explicit substring checks so 360 scenes do not accidentally go through LLFF pose sampling.
+            if '360' in source_lower:
                 pseudo_poses = generate_random_poses_360(self.train_cameras[resolution_scale])
+            else:
+                pseudo_poses = generate_random_poses_llff(self.train_cameras[resolution_scale])
+
             view = self.train_cameras[resolution_scale][0]
             for pose in pseudo_poses:
                 pseudo_cams.append(PseudoCamera(
