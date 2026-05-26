@@ -3,22 +3,21 @@
 
 Run from the SREGS environment through:
   conda run -n qwen3vl python tools/qwen_vla_mask_worker.py \
-      --model /path/to/Qwen3-VL --image pseudo_rgb.png \
+      --model /path/to/Qwen3-VL-or-HF-cache --image pseudo_rgb.png \
       --panel diagnostic_panel.png --out qwen_regions.json
 
-The worker returns strict JSON:
-{
-  "regions": [
-    {"category": "geometry_ambiguity" | "appearance_collapse",
-     "box": [x1, y1, x2, y2], "confidence": 0.0-1.0}
-  ]
-}
+`--model` can be either:
+  1) a real model directory containing config.json, or
+  2) a HuggingFace cache parent directory such as
+     .../models--Qwen--Qwen3-VL-8B-Instruct.
+In case (2), this script resolves snapshots/<hash> automatically.
 """
 
 import argparse
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict
 
 import torch
@@ -69,6 +68,41 @@ Coordinate rule:
 """
 
 
+def resolve_model_path(model_path: str) -> str:
+    """Resolve a model path or HuggingFace cache parent to a loadable directory."""
+    p = Path(model_path).expanduser()
+    if not p.exists():
+        # Keep remote model ids untouched, but absolute/local-looking paths should fail clearly.
+        if os.path.isabs(model_path) or os.sep in model_path:
+            raise FileNotFoundError(f"Model path does not exist: {model_path}")
+        return model_path
+
+    if (p / "config.json").exists():
+        return str(p)
+
+    # HuggingFace cache layout: models--org--repo/snapshots/<revision>/config.json
+    snap_root = p / "snapshots"
+    if snap_root.is_dir():
+        candidates = [q for q in snap_root.iterdir() if (q / "config.json").exists()]
+        if candidates:
+            candidates.sort(key=lambda q: q.stat().st_mtime, reverse=True)
+            return str(candidates[0])
+
+    # Sometimes users pass an upper folder. Search shallowly for config.json.
+    candidates = []
+    for q in p.glob("**/config.json"):
+        if "snapshots" in q.parts or q.parent.name.startswith("Qwen") or "Qwen" in str(q.parent):
+            candidates.append(q.parent)
+    if candidates:
+        candidates.sort(key=lambda q: q.stat().st_mtime, reverse=True)
+        return str(candidates[0])
+
+    raise FileNotFoundError(
+        f"Could not find a loadable model directory under {model_path}. "
+        "Expected config.json or snapshots/<revision>/config.json."
+    )
+
+
 def extract_json(text: str) -> Dict[str, Any]:
     text = text.strip()
     if text.startswith("```"):
@@ -107,7 +141,6 @@ def sanitize(data: Dict[str, Any], image_path: str) -> Dict[str, Any]:
             x1, y1, x2, y2 = [int(round(float(v))) for v in box]
         except Exception:
             continue
-        # Coordinates are expected for panel quadrant A, which has the same size as --image.
         x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
         y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
         if x2 <= x1 or y2 <= y1:
@@ -138,17 +171,25 @@ def main():
     if not args.model:
         raise RuntimeError("Set --model or QWEN3VL_MODEL to a local Qwen3-VL model path/name.")
 
+    resolved_model = resolve_model_path(args.model)
+    print(f"[qwen_vla_mask_worker] resolved model path: {resolved_model}", flush=True)
+
     qwen_image = args.panel if args.panel else args.image
     if not os.path.exists(qwen_image):
         raise FileNotFoundError(qwen_image)
 
     model = AutoModelForImageTextToText.from_pretrained(
-        args.model,
+        resolved_model,
         torch_dtype="auto",
         device_map="auto",
         trust_remote_code=True,
+        local_files_only=os.path.exists(resolved_model),
     )
-    processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+        resolved_model,
+        trust_remote_code=True,
+        local_files_only=os.path.exists(resolved_model),
+    )
 
     messages = [{
         "role": "user",
