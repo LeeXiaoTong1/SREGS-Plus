@@ -3,7 +3,8 @@
 
 Run from the SREGS environment through:
   conda run -n qwen3vl python tools/qwen_vla_mask_worker.py \
-      --model /path/to/Qwen3-VL --image pseudo_rgb.png --out qwen_regions.json
+      --model /path/to/Qwen3-VL --image pseudo_rgb.png \
+      --panel diagnostic_panel.png --out qwen_regions.json
 
 The worker returns strict JSON:
 {
@@ -33,13 +34,18 @@ except Exception:
 PROMPT = """
 You are a sparse-view 3D Gaussian Splatting overfitting diagnostician.
 
-You will see a pseudo novel-view rendering. There is no ground-truth image.
-Your task is NOT to judge aesthetics. Find only regions that likely reveal
-sparse-view overfitting in an unseen view.
+You will see a 2x2 diagnostic panel from a pseudo novel view:
+A: pseudo render from the current Gaussian model.
+B: pseudo depth visualization.
+C: pseudo alpha/coverage map.
+D: nearest training image reference.
+
+There is no ground-truth image for the pseudo view. Your task is NOT to judge aesthetics.
+Find only regions in A that likely reveal sparse-view overfitting in an unseen view.
 
 Allowed categories:
 1. geometry_ambiguity: shape drift, unstable object boundary, stretched geometry,
-   floaters, broken structure, depth/occlusion inconsistency.
+   floaters, broken structure, depth/occlusion inconsistency, missing coverage.
 2. appearance_collapse: color collapse, background collapse, view-dependent color
    artifact, severe texture blur caused by training-view memorization.
 
@@ -53,8 +59,9 @@ Return strict JSON only:
   ]
 }
 
-Rules:
-- Coordinates must be pixel coordinates in the input image.
+Coordinate rule:
+- The returned box must be in the coordinate system of A, the top-left pseudo render.
+- Do not return coordinates for B/C/D.
 - Use at most 6 boxes.
 - Prefer high-confidence regions. If no clear overfitting artifact is visible,
   return {"regions": []}.
@@ -100,6 +107,7 @@ def sanitize(data: Dict[str, Any], image_path: str) -> Dict[str, Any]:
             x1, y1, x2, y2 = [int(round(float(v))) for v in box]
         except Exception:
             continue
+        # Coordinates are expected for panel quadrant A, which has the same size as --image.
         x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
         y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
         if x2 <= x1 or y2 <= y1:
@@ -120,7 +128,8 @@ def sanitize(data: Dict[str, Any], image_path: str) -> Dict[str, Any]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default=os.environ.get("QWEN3VL_MODEL", ""))
-    ap.add_argument("--image", type=str, required=True)
+    ap.add_argument("--image", type=str, required=True, help="Top-left pseudo render image. Used for box sanitization.")
+    ap.add_argument("--panel", type=str, default="", help="2x2 diagnostic panel. Preferred Qwen input.")
     ap.add_argument("--out", type=str, required=True)
     ap.add_argument("--max_new_tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=0.0)
@@ -129,24 +138,29 @@ def main():
     if not args.model:
         raise RuntimeError("Set --model or QWEN3VL_MODEL to a local Qwen3-VL model path/name.")
 
+    qwen_image = args.panel if args.panel else args.image
+    if not os.path.exists(qwen_image):
+        raise FileNotFoundError(qwen_image)
+
     model = AutoModelForImageTextToText.from_pretrained(
         args.model,
         torch_dtype="auto",
         device_map="auto",
+        trust_remote_code=True,
     )
-    processor = AutoProcessor.from_pretrained(args.model)
+    processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
 
     messages = [{
         "role": "user",
         "content": [
-            {"type": "image", "image": args.image},
+            {"type": "image", "image": qwen_image},
             {"type": "text", "text": PROMPT},
         ],
     }]
 
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     if process_vision_info is None:
-        inputs = processor(text=[text], images=[Image.open(args.image).convert("RGB")], padding=True, return_tensors="pt")
+        inputs = processor(text=[text], images=[Image.open(qwen_image).convert("RGB")], padding=True, return_tensors="pt")
     else:
         image_inputs, video_inputs = process_vision_info(messages)
         inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
